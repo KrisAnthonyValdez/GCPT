@@ -1,88 +1,231 @@
-package main
+package blockchain
 
 import (
-        "crypto/sha256"
-        "encoding/json"
-        "fmt"
-        "strconv"
-        "strings"
-        "time"
-  
-  type Block struct {
-        data         map[string]interface{}
-        hash         string
-        previousHash string
-        timestamp    time.Time
-        pow          int
+	"encoding/hex"
+	"fmt"
+	"os"
+	"runtime"
+
+	"github.com/dgraph-io/badger"
+)
+
+const (
+	dbPath      = "./tmp/blocks"
+	dbFile      = "./tmp/blocks/MANIFEST"          // This can be used to verify that the blockchain exists
+	genesisData = "First Transaction from Genesis" // This is arbitrary data for our genesis data
+)
+
+//BlockChain is an array of block pointers
+type BlockChain struct {
+	LastHash []byte
+	Database *badger.DB
 }
-  
-type Blockchain struct {
-        genesisBlock Block
-        chain        []Block
-        difficulty   int
-}
-  
-func (b Block) calculateHash() string {
-        data, _ := json.Marshal(b.data)
-        blockData := b.previousHash + string(data) + b.timestamp.String() + strconv.Itoa(b.pow)
-        blockHash := sha256.Sum256([]byte(blockData))
-        return fmt.Sprintf("%x", blockHash)
+type BlockChainIterator struct {
+	CurrentHash []byte
+	Database    *badger.DB
 }
 
-func (b *Block) mine(difficulty int) {
-        for !strings.HasPrefix(b.hash, strings.Repeat("0", difficulty)) {
-                b.pow++
-                b.hash = b.calculateHash()
-        }
+func DBexists() bool {
+	if _, err := os.Stat(dbFile); os.IsNotExist(err) {
+		return false
+	}
+	return true
 }
 
-func CreateBlockchain(difficulty int) Blockchain {
-        genesisBlock := Block{
-                hash:      "0",
-                timestamp: time.Now(),
-        }
-        return Blockchain{
-                genesisBlock,
-                []Block{genesisBlock},
-                difficulty,
-        }
-}
-  
-func (b *Blockchain) addBlock(from, to string, amount float64) {
-        blockData := map[string]interface{}{
-                "from":   from,
-                "to":     to,
-                "amount": amount,
-        }
-        lastBlock := b.chain[len(b.chain)-1]
-        newBlock := Block{
-                data:         blockData,
-                previousHash: lastBlock.hash,
-                timestamp:    time.Now(),
-        }
-        newBlock.mine(b.difficulty)
-        b.chain = append(b.chain, newBlock)
-}
-  
-func (b Blockchain) isValid() bool {
-        for i := range b.chain[1:] {
-                previousBlock := b.chain[i]
-                currentBlock := b.chain[i+1]
-                if currentBlock.hash != currentBlock.calculateHash() || currentBlock.previousHash != previousBlock.hash {
-                        return false
-                }
-        }
-        return true
-}
-  
-func main() {
-        // create a new blockchain instance with a mining difficulty of 2
-        blockchain := CreateBlockchain(2)
+//ContinueBlockChain will be called to append to an existing blockchain
+func ContinueBlockChain(address string) *BlockChain {
+	if !DBexists() {
+		fmt.Println("No blockchain found, please create one first")
+		runtime.Goexit()
+	}
 
-        // record transactions on the blockchain for Alice, Bob, and John
-        blockchain.addBlock("Alice", "Bob", 5)
-        blockchain.addBlock("John", "Bob", 2)
+	var lastHash []byte
 
-        // check if the blockchain is valid; expecting true
-        fmt.Println(blockchain.isValid())
+	opts := badger.DefaultOptions(dbPath)
+	db, err := badger.Open(opts)
+	Handle(err)
+
+	err = db.Update(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte("lh"))
+		Handle(err)
+		err = item.Value(func(val []byte) error {
+			lastHash = val
+			return nil
+		})
+		Handle(err)
+		return err
+	})
+	Handle(err)
+
+	chain := BlockChain{lastHash, db}
+	return &chain
+}
+
+//InitBlockChain will be what starts a new blockChain
+func InitBlockChain(address string) *BlockChain {
+	var lastHash []byte
+
+	if DBexists() {
+		fmt.Println("blockchain already exists")
+		runtime.Goexit()
+	}
+
+	opts := badger.DefaultOptions(dbPath)
+	db, err := badger.Open(opts)
+	Handle(err)
+
+	err = db.Update(func(txn *badger.Txn) error {
+
+		cbtx := CoinbaseTx(address, genesisData)
+		genesis := Genesis(cbtx)
+		fmt.Println("Genesis Created")
+		err = txn.Set(genesis.Hash, genesis.Serialize())
+		Handle(err)
+		err = txn.Set([]byte("lh"), genesis.Hash)
+
+		lastHash = genesis.Hash
+
+		return err
+
+	})
+
+	Handle(err)
+
+	blockchain := BlockChain{lastHash, db}
+	return &blockchain
+}
+
+// AddBlock Will add a Block type unit to a blockchain
+func (chain *BlockChain) AddBlock(transactions []*Transaction) {
+	var lastHash []byte
+
+	err := chain.Database.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte("lh"))
+		Handle(err)
+		err = item.Value(func(val []byte) error {
+			lastHash = val
+			return nil
+		})
+		Handle(err)
+		return err
+	})
+	Handle(err)
+
+	newBlock := CreateBlock(transactions, lastHash)
+	err = chain.Database.Update(func(transaction *badger.Txn) error {
+		err := transaction.Set(newBlock.Hash, newBlock.Serialize())
+		Handle(err)
+		err = transaction.Set([]byte("lh"), newBlock.Hash)
+
+		chain.LastHash = newBlock.Hash
+		return err
+	})
+	Handle(err)
+}
+
+// Iterator takes our BlockChain struct and returns it as a BlockCHainIterator struct
+func (chain *BlockChain) Iterator() *BlockChainIterator {
+	iterator := BlockChainIterator{chain.LastHash, chain.Database}
+
+	return &iterator
+}
+
+// Next will iterate through the BlockChainIterator
+func (iterator *BlockChainIterator) Next() *Block {
+	var block *Block
+
+	err := iterator.Database.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(iterator.CurrentHash)
+		Handle(err)
+
+		err = item.Value(func(val []byte) error {
+			block = Deserialize(val)
+			return nil
+		})
+		Handle(err)
+		return err
+	})
+	Handle(err)
+
+	iterator.CurrentHash = block.PrevHash
+
+	return block
+}
+func (chain *BlockChain) FindUnspentTransactions(address string) []Transaction {
+	var unspentTxs []Transaction
+
+	spentTXOs := make(map[string][]int)
+
+	iter := chain.Iterator()
+
+	for {
+		block := iter.Next()
+
+		for _, tx := range block.Transactions {
+			txID := hex.EncodeToString(tx.ID)
+
+		Outputs:
+			for outIdx, out := range tx.Outputs {
+				if spentTXOs[txID] != nil {
+					for _, spentOut := range spentTXOs[txID] {
+						if spentOut == outIdx {
+							continue Outputs
+						}
+					}
+				}
+				if out.CanBeUnlocked(address) {
+					unspentTxs = append(unspentTxs, *tx)
+				}
+			}
+			if !tx.IsCoinbase() {
+				for _, in := range tx.Inputs {
+					if in.CanUnlock(address) {
+						inTxID := hex.EncodeToString(in.ID)
+						spentTXOs[inTxID] = append(spentTXOs[inTxID], in.Out)
+					}
+				}
+			}
+		}
+
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+	return unspentTxs
+}
+
+func (chain *BlockChain) FindUTXO(address string) []TxOutput {
+	var UTXOs []TxOutput
+	unspentTransactions := chain.FindUnspentTransactions(address)
+	for _, tx := range unspentTransactions {
+		for _, out := range tx.Outputs {
+			if out.CanBeUnlocked(address) {
+				UTXOs = append(UTXOs, out)
+			}
+		}
+	}
+
+	return UTXOs
+}
+
+func (chain *BlockChain) FindSpendableOutputs(address string, amount int) (int, map[string][]int) {
+	unspentOuts := make(map[string][]int)
+	unspentTxs := chain.FindUnspentTransactions(address)
+	accumulated := 0
+
+Work:
+	for _, tx := range unspentTxs {
+		txID := hex.EncodeToString(tx.ID)
+		for outIdx, out := range tx.Outputs {
+			if out.CanBeUnlocked(address) && accumulated < amount {
+				accumulated += out.Value
+				unspentOuts[txID] = append(unspentOuts[txID], outIdx)
+
+				if accumulated >= amount {
+					break Work
+				}
+			}
+		}
+	}
+	return accumulated, unspentOuts
 }
